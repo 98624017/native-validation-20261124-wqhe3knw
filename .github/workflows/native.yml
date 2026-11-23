@@ -1,0 +1,144 @@
+name: Native handoff validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_revision:
+        description: Exact encrypted snapshot revision
+        required: true
+        type: string
+      capsule_sha256:
+        description: SHA-256 of candidate.capsule
+        required: true
+        type: string
+      targets:
+        description: all or a comma-separated subset of windows-x64,macos-arm64,macos-x64
+        required: true
+        default: all
+        type: string
+      export_updates:
+        description: Also export canonical automatic-update assets after native validation
+        required: false
+        default: false
+        type: boolean
+      registry_pressure:
+        description: Run native database contention and packaged restart stress tests
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Validate requested native targets
+        id: targets
+        shell: bash
+        env:
+          REQUESTED_TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          matrix=$(node capsule.mjs plan --targets "$REQUESTED_TARGETS")
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+  native:
+    name: native-${{ matrix.target }}
+    if: github.actor == github.repository_owner
+    needs: plan
+    # One immutable candidate/capsule/key per repository; new candidates require a fresh repository.
+    concurrency:
+      group: native-handoff-${{ matrix.target }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      NATIVE_TARGET_PLATFORM: ${{ matrix.platform }}
+      NATIVE_TARGET_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Authenticate and open candidate
+        timeout-minutes: 5
+        shell: bash
+        env:
+          CAPSULE_KEY: ${{ secrets.CAPSULE_KEY }}
+          CAPSULE_SHA256: ${{ inputs.capsule_sha256 }}
+          CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$CAPSULE_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$CANDIDATE_REVISION" =~ ^[a-f0-9]{40}$ ]]
+          node -e 'const assert = require("node:assert/strict"); assert.match(process.version, /^v22\./); assert.equal(process.platform, process.env.NATIVE_TARGET_PLATFORM); assert.equal(process.arch, process.env.NATIVE_TARGET_ARCH);'
+          printf '%s' "$CAPSULE_KEY" | node capsule.mjs open --bundle candidate.capsule --output "$RUNNER_TEMP/candidate.bundle" --expected-sha256 "$CAPSULE_SHA256"
+          git clone --quiet --branch main --config core.autocrlf=false "$RUNNER_TEMP/candidate.bundle" "$RUNNER_TEMP/candidate" 2> "$RUNNER_TEMP/private-clone.log"
+          test "$(git -C "$RUNNER_TEMP/candidate" rev-parse HEAD)" = "$CANDIDATE_REVISION"
+      - name: Build protected candidate and validate native lifecycle
+        id: validate
+        timeout-minutes: 40
+        shell: bash
+        env:
+          NATIVE_CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
+          NATIVE_CAPSULE_SHA256: ${{ inputs.capsule_sha256 }}
+          NATIVE_EXPORT_UPDATES: ${{ inputs.export_updates }}
+          NATIVE_REGISTRY_PRESSURE: ${{ inputs.registry_pressure }}
+        run: |
+          set -euo pipefail
+          umask 077
+          export NATIVE_REPORT_DIRECTORY="$RUNNER_TEMP/public-report"
+          export NATIVE_PRIVATE_LOG_PATH="$RUNNER_TEMP/private-validation.log"
+          node "$RUNNER_TEMP/candidate/scripts/generation-handoff-validation/native-run.mjs" >> "$NATIVE_PRIVATE_LOG_PATH" 2>&1
+      - name: Encrypt private failure log
+        if: always()
+        timeout-minutes: 5
+        shell: bash
+        env:
+          CAPSULE_KEY: ${{ secrets.CAPSULE_KEY }}
+          CAPSULE_SHA256: ${{ inputs.capsule_sha256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -f "$RUNNER_TEMP/private-validation.log" ]]; then
+            node --input-type=module -e 'import { readFileSync } from "node:fs"; import { openCapsule } from "./capsule.mjs"; try { openCapsule(readFileSync("candidate.capsule"), process.env.CAPSULE_KEY.trim(), process.env.CAPSULE_SHA256); } catch { console.error("Private log capsule key does not match the dispatched candidate"); process.exit(1); }'
+            mkdir -p "$RUNNER_TEMP/public-report"
+            printf '%s' "$CAPSULE_KEY" | node capsule.mjs seal-with-key --bundle "$RUNNER_TEMP/private-validation.log" --output "$RUNNER_TEMP/public-report/private-log.capsule"
+          fi
+      - name: Upload exact verified installer, sanitized report and encrypted private log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-handoff-${{ matrix.target }}
+          path: |
+            ${{ steps.validate.outcome == 'success' && steps.validate.outputs.installer_path || '' }}
+            ${{ inputs.export_updates && steps.validate.outcome == 'success' && steps.validate.outputs.update_paths || '' }}
+            ${{ runner.temp }}/public-report/native-handoff.json
+            ${{ runner.temp }}/public-report/private-log.capsule
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove private candidate and plaintext logs
+        if: always()
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          node --input-type=module -e 'import { rm } from "node:fs/promises"; import path from "node:path"; const root = process.env.RUNNER_TEMP; if (!root || !path.isAbsolute(root) || path.resolve(root) === path.parse(path.resolve(root)).root) throw new Error("Missing runner temp"); for (const name of ["candidate", "candidate.bundle", "private-clone.log", "private-validation.log"]) await rm(path.join(root, name), { recursive: name === "candidate", force: true });'
